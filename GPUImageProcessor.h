@@ -13,6 +13,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Write `src` into `dst` in place. Returns YES on success. Thread-safe.
 - (BOOL)transferFrom:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst;
 
+/// Same as -transferFrom:into: but returns the underlying VT OSStatus for
+/// diagnostic logging.
+- (OSStatus)transferFromStatus:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst;
+
 @end
 
 NS_ASSUME_NONNULL_END
