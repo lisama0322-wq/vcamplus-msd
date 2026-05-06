@@ -1,6 +1,6 @@
 Package: com.vcamplus.msd
 Name: VCamPlus MediaServer 全局替换
-Version: 0.1.0
+Version: 0.7.1
 Architecture: iphoneos-arm64
 Depends: firmware (>= 15.0), mobilesubstrate
 Conflicts: com.local.vcameracrack
