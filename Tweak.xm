@@ -1,26 +1,21 @@
 // vcamplus-msd: mediaserverd-side virtual camera frame replacement.
 //
-// Architecture mirrors vcam124. Key correctness invariants on the hot path
-// (BWNodeOutput emitSampleBuffer: fires ~1000-3000 times/sec):
+// CMCapture framework (which owns BWNodeOutput) is lazy-loaded by
+// mediaserverd — it doesn't appear until a camera client first opens a
+// session. Our __attribute__((constructor)) runs at dylib load time, well
+// before CMCapture is loaded, so a one-shot objc_getClass("BWNodeOutput")
+// returns NULL and the hook never gets installed.
 //
-//   1. Wrap the entire hook in @autoreleasepool. mediaserverd's calling
-//      thread does NOT drain the outer pool between emits, so any
-//      autoreleased object accumulates until the system OOMs / watchdogs.
-//      vcam124 does this via objc_autoreleasePoolPush at the top of its
-//      hook IMP — same idea.
-//   2. Hot path must NOT allocate ObjC objects. No NSString format, no
-//      NSDictionary writes, no @synchronized(NSDictionary). Everything
-//      is _Atomic counters or sub-microsecond os_unfair_lock.
-//   3. Mutate the original CVPixelBuffer in place via VT. Do NOT create a
-//      new sample buffer — system Camera UI tracks the original IOSurface
-//      and bindings, replacing them produces a black screen + crash on
-//      shutter press.
+// Use _dyld_register_func_for_add_image to retry hook installation every
+// time a new image (framework) loads. Once BWNodeOutput becomes available,
+// dispatch_once gates the actual install so it runs exactly once.
 
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
+#import <mach-o/dyld.h>
 
 #import "VCamCore.h"
 
@@ -40,12 +35,9 @@ static void hooked_emit(id _self, SEL sel, CMSampleBufferRef sb) {
     if (gOrigBWNodeOutputEmit) gOrigBWNodeOutputEmit(_self, sel, sb);
 }
 
-static void install_emit_hook(void) {
+static void do_install(void) {
     Class cls = objc_getClass("BWNodeOutput");
-    if (!cls) {
-        NSLog(@"[vcam-msd] BWNodeOutput not found — skipping");
-        return;
-    }
+    if (!cls) return;
     SEL sel = @selector(emitSampleBuffer:);
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
@@ -65,16 +57,29 @@ static void install_emit_hook(void) {
     }
 }
 
+static void try_install(void) {
+    static dispatch_once_t once;
+    if (objc_getClass("BWNodeOutput")) {
+        dispatch_once(&once, ^{ do_install(); });
+    }
+}
+
+static void on_image_loaded(const struct mach_header *mh, intptr_t slide) {
+    try_install();
+}
+
 __attribute__((constructor))
 static void vcamplus_msd_init(void) {
     @autoreleasepool {
         NSString *proc = NSProcessInfo.processInfo.processName;
         if (![proc isEqualToString:@"mediaserverd"]) return;
-        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.7.0, P0 fixes + VT latency stats)");
+        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.7.3, deferred hook install)");
         NSLog(@"[vcam-msd] To activate: touch /var/mobile/Media/DCIM/vcam_msd_active");
-        NSLog(@"[vcam-msd] To deactivate: rm /var/mobile/Media/DCIM/vcam_msd_active");
         NSLog(@"[vcam-msd] Stats: /var/mobile/Media/DCIM/vcam_msd_stats.txt (every 5s)");
         (void)[VCamCore shared];
-        install_emit_hook();
+        // Try once now in case CMCapture is already loaded.
+        try_install();
+        // And register a callback so we retry as new frameworks load.
+        _dyld_register_func_for_add_image(on_image_loaded);
     }
 }
