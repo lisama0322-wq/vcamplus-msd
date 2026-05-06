@@ -2,10 +2,24 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <mach/mach_time.h>
 #import <stdatomic.h>
+#import <dlfcn.h>
+
+// vcam124 reads kVTPixelTransferPropertyKey_RealTime / kVTScalingMode_*
+// indirectly from __DATA_CONST (ldr through GOT). If they aren't exported on
+// the running iOS version, that ldr returns NULL and the function skips.
+//
+// We were calling VTSessionSetProperty with these constants directly. If the
+// symbol isn't published as a weak export on iOS 16.5, dyld fails to bind
+// and the entire vcamplus-msd.dylib silently fails to load — explaining why
+// v0.7 / v0.7.1 produced real-camera output (no dylib in mediaserverd) while
+// v0.5 (which never referenced these symbols) did load and replace frames.
+//
+// Resolve via dlsym at init time. Missing symbol = skip property; dylib still
+// loads cleanly.
 
 @implementation GPUImageProcessor {
     VTPixelTransferSessionRef _session;
-    NSRecursiveLock *_lock;     // matches vcam124's NSRecursiveLock at VCamCore.[0x18]
+    NSRecursiveLock *_lock;
     mach_timebase_info_data_t _tb;
 
     _Atomic uint64_t _vtCount;
@@ -24,24 +38,20 @@
             return self;
         }
 
-        // P0 fix #1 — RealTime hint. Tells VT this is a camera/realtime pipeline
-        // so it picks the fastest hardware blit path over high-quality slow path.
-        // vcam124 sets this at 0x1e764. Without it, single-call latency is 5-10×
-        // higher.
-        OSStatus s1 = VTSessionSetProperty(_session,
-            kVTPixelTransferPropertyKey_RealTime,
-            kCFBooleanTrue);
+        // Resolve VT property keys at runtime. These are CFStringRef *constants*
+        // exported as data, so dlsym returns a pointer to the CFStringRef.
+        void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_LAZY);
+        CFStringRef *pRT  = vt ? (CFStringRef *)dlsym(vt, "kVTPixelTransferPropertyKey_RealTime")    : NULL;
+        CFStringRef *pSM  = vt ? (CFStringRef *)dlsym(vt, "kVTPixelTransferPropertyKey_ScalingMode") : NULL;
+        CFStringRef *pCrop= vt ? (CFStringRef *)dlsym(vt, "kVTScalingMode_CropSourceToCleanAperture"): NULL;
 
-        // P0 fix #2 — CropSourceToCleanAperture scaling. Fastest scaling mode
-        // available to VT — does aspect-preserving crop instead of bilinear
-        // resample. vcam124 uses this at 0x1e74c. v0.4 used kVTScalingMode_Normal
-        // which is bilinear stretch — slower and aspect-distorting.
-        OSStatus s2 = VTSessionSetProperty(_session,
-            kVTPixelTransferPropertyKey_ScalingMode,
-            kVTScalingMode_CropSourceToCleanAperture);
-
-        NSLog(@"[vcam-msd] VT session configured: RealTime=%d CropMode=%d",
-              (int)s1, (int)s2);
+        if (pRT && *pRT) {
+            VTSessionSetProperty(_session, *pRT, kCFBooleanTrue);
+        }
+        if (pSM && *pSM && pCrop && *pCrop) {
+            VTSessionSetProperty(_session, *pSM, *pCrop);
+        }
+        NSLog(@"[vcam-msd] VT session: RT=%p SM=%p Crop=%p", pRT, pSM, pCrop);
     }
     return self;
 }
@@ -56,23 +66,18 @@
 
 - (BOOL)transferFrom:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst {
     if (!src || !dst || !_session) return NO;
-
     uint64_t t0 = mach_absolute_time();
-
     [_lock lock];
     OSStatus s = VTPixelTransferSessionTransferImage(_session, src, dst);
     [_lock unlock];
-
     uint64_t t1 = mach_absolute_time();
     uint64_t dtNs = (t1 - t0) * _tb.numer / _tb.denom;
     atomic_fetch_add_explicit(&_vtCount,   1,    memory_order_relaxed);
     atomic_fetch_add_explicit(&_vtTotalNs, dtNs, memory_order_relaxed);
-    uint64_t prevMax = atomic_load_explicit(&_vtMaxNs, memory_order_relaxed);
-    while (dtNs > prevMax &&
-           !atomic_compare_exchange_weak_explicit(&_vtMaxNs, &prevMax, dtNs,
-               memory_order_relaxed, memory_order_relaxed)) {
-    }
-
+    uint64_t prev = atomic_load_explicit(&_vtMaxNs, memory_order_relaxed);
+    while (dtNs > prev &&
+           !atomic_compare_exchange_weak_explicit(&_vtMaxNs, &prev, dtNs,
+               memory_order_relaxed, memory_order_relaxed)) {}
     return (s == noErr);
 }
 
