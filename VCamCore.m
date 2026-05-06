@@ -13,6 +13,25 @@ static NSString *const kVCamSourceVideo = @"/var/mobile/Media/DCIM/vcam.mp4";
 // fast. We cache isEnabled() for 200ms so the file stat is amortized.
 static const uint64_t kEnabledCacheTTLNs = 200ULL * NSEC_PER_MSEC;
 
+// VTPixelTransferSession silently writes garbage when the destination uses one
+// of Apple's private formats (e.g. '-8f0' that the system Camera app's high-
+// res preview pipeline emits at 2304x1650). Skipping replacement for unknown
+// formats lets the original frame pass through — system Camera shows the real
+// preview instead of a black screen, while standard 420v/420f/BGRA consumers
+// (GT, X, Bitget WV, every third-party app) still see our virtual frame.
+static BOOL vcam_isReplaceableFormat(OSType fmt) {
+    switch (fmt) {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:  // '420v'
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:   // '420f'
+        case kCVPixelFormatType_32BGRA:                         // 'BGRA'
+        case kCVPixelFormatType_32ARGB:
+        case kCVPixelFormatType_422YpCbCr8:                     // '2vuy'
+            return YES;
+        default:
+            return NO;
+    }
+}
+
 @interface VCamCore ()
 @property (nonatomic, strong, readwrite) LocalVideoPlayer *videoPlayer;
 @property (nonatomic, strong, readwrite) GPUImageProcessor *gpuProcessor;
@@ -70,6 +89,22 @@ static const uint64_t kEnabledCacheTTLNs = 200ULL * NSEC_PER_MSEC;
     if (!origPB) return NULL;
 
     OSType origFormat = CVPixelBufferGetPixelFormatType(origPB);
+    if (!vcam_isReplaceableFormat(origFormat)) {
+        // Log once per unique format to avoid log spam on the hot path.
+        static NSMutableSet *seen = nil; static dispatch_once_t once;
+        dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
+        NSNumber *k = @(origFormat);
+        @synchronized(seen) {
+            if (![seen containsObject:k]) {
+                [seen addObject:k];
+                char fcc[5] = {0};
+                fcc[0] = (origFormat >> 24) & 0xff; fcc[1] = (origFormat >> 16) & 0xff;
+                fcc[2] = (origFormat >> 8) & 0xff;  fcc[3] = origFormat & 0xff;
+                NSLog(@"[vcam-msd] skip non-replaceable format: '%s' (0x%08x)", fcc, (unsigned)origFormat);
+            }
+        }
+        return NULL;
+    }
     size_t origW = CVPixelBufferGetWidth(origPB);
     size_t origH = CVPixelBufferGetHeight(origPB);
 
