@@ -7,22 +7,25 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// Central state holder for the mediaserverd-side virtual camera.
-/// Owns the video decoder, GPU processor, and the per-call replacement logic.
+/// Mediaserverd-side virtual camera coordinator. Owns the video decoder and
+/// GPU transfer session. Mutates camera frames in place — the original
+/// CMSampleBuffer / CVPixelBuffer / IOSurface objects are preserved, only
+/// their pixel content is overwritten.
 @interface VCamCore : NSObject
 
 @property (class, nonatomic, readonly) VCamCore *shared;
 @property (nonatomic, strong, readonly) LocalVideoPlayer *videoPlayer;
 @property (nonatomic, strong, readonly) GPUImageProcessor *gpuProcessor;
 
-/// Cheap, cached check for whether replacement should run. Cached ~200ms.
+/// Cached ~200ms. Returns YES when a vcam.mp4 source is ready.
 - (BOOL)isEnabled;
 
-/// Build a replacement CMSampleBuffer that mimics `original` (same format, size,
-/// timing) but with our virtual frame as pixel content. Returns NULL on any
-/// failure, in which case the caller MUST forward the original unchanged.
-/// Returned buffer is retained — caller releases.
-- (nullable CMSampleBufferRef)replaceSampleBuffer:(CMSampleBufferRef)original CF_RETURNS_RETAINED;
+/// Overwrite the pixel content of `sampleBuffer` with the latest frame from
+/// the virtual video source. The sample buffer's format desc, timing,
+/// attachments, and IOSurface bindings are all left untouched. Returns YES
+/// when content was successfully written; NO when the caller should pass the
+/// sample buffer through unchanged.
+- (BOOL)replaceInPlace:(CMSampleBufferRef)sampleBuffer;
 
 @end
 
