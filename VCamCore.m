@@ -4,23 +4,22 @@
 
 #import <mach/mach_time.h>
 #import <sys/stat.h>
+#import <stdatomic.h>
 
 static NSString *const kVCamSourceVideo = @"/var/mobile/Media/DCIM/vcam.mp4";
 static NSString *const kVCamStatsFile   = @"/var/mobile/Media/DCIM/vcam_msd_stats.txt";
 
 static const uint64_t kEnabledCacheTTLNs = 200ULL * NSEC_PER_MSEC;
 
-// Lossy-compressed pixel formats. VTPixelTransferSession cannot write to these
-// destinations — the underlying IOSurface stores compressed tiles, not raw
-// pixels. Attempting to transfer either fails silently or corrupts the buffer.
-// Detected on iPhone 14/15 Pro system Camera high-res preview path.
-static BOOL vcam_isLossyDestination(OSType fmt) {
+// Lossy-compressed pixel formats. VTPixelTransferSession cannot write into
+// these (compressed-tile IOSurface backing). Skip outright.
+static inline BOOL vcam_isLossyDestination(OSType fmt) {
     switch (fmt) {
-        case 0x2D387630:  // '-8v0' Lossy 420 video range
-        case 0x2D386630:  // '-8f0' Lossy 420 full range
-        case 0x2D787630:  // '-xv0' Lossy 10-bit 420 video range
-        case 0x2D786630:  // '-xf0' Lossy 10-bit 420 full range
-        case 0x2D343230:  // '-420' generic lossy
+        case 0x2D387630:  // '-8v0'
+        case 0x2D386630:  // '-8f0'
+        case 0x2D787630:  // '-xv0'
+        case 0x2D786630:  // '-xf0'
+        case 0x2D343230:  // '-420'
             return YES;
         default:
             return NO;
@@ -37,20 +36,21 @@ static BOOL vcam_isLossyDestination(OSType fmt) {
     BOOL _enabledCached;
     BOOL _playerStarted;
 
-    // Diagnostic counters (atomic via dispatch_queue or just int32 increments).
-    // Camera frames hit at ~1000/s so plain int32 reads can race but are good
-    // enough for diagnostic dumps.
-    uint64_t _hitTotal;
-    uint64_t _hitNonVideo;
-    uint64_t _hitNoPB;
-    uint64_t _hitLossyDst;
-    uint64_t _hitNoSrc;
-    uint64_t _hitVTAttempt;
-    uint64_t _hitVTSuccess;
-    uint64_t _hitVTFail;
-    OSStatus _lastVTStatus;
+    // Atomic counters — incremented on hot path, sampled by stats timer.
+    // No ObjC allocation, no lock, just _Atomic adds.
+    _Atomic uint64_t _hitTotal;
+    _Atomic uint64_t _hitNonVideo;
+    _Atomic uint64_t _hitNoPB;
+    _Atomic uint64_t _hitLossyDst;
+    _Atomic uint64_t _hitNoSrc;
+    _Atomic uint64_t _hitVTAttempt;
+    _Atomic uint64_t _hitVTSuccess;
+    _Atomic uint64_t _hitVTFail;
+    _Atomic int      _lastVTStatus;
+    _Atomic uint32_t _lastDstFmt;
+    _Atomic uint32_t _lastDstW;
+    _Atomic uint32_t _lastDstH;
 
-    NSMutableDictionary<NSString *, NSNumber *> *_uniqueShapes;  // dim+fmt -> count
     dispatch_source_t _statsTimer;
 }
 
@@ -63,44 +63,47 @@ static BOOL vcam_isLossyDestination(OSType fmt) {
 - (instancetype)init {
     if ((self = [super init])) {
         _gpuProcessor = [GPUImageProcessor new];
-        _videoPlayer = [[LocalVideoPlayer alloc] initWithPath:kVCamSourceVideo];
-        _uniqueShapes = [NSMutableDictionary new];
+        _videoPlayer  = [[LocalVideoPlayer alloc] initWithPath:kVCamSourceVideo];
 
-        // Periodic stats dump for offline diagnosis.
+        // Stats dump runs on a background queue. Hot path never allocates;
+        // this thread does the formatting work.
         dispatch_queue_t q = dispatch_queue_create("com.vcamplus.msd.stats", DISPATCH_QUEUE_SERIAL);
         _statsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(_statsTimer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                                   5 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
         __weak typeof(self) weakSelf = self;
-        dispatch_source_set_event_handler(_statsTimer, ^{ [weakSelf dumpStats]; });
+        dispatch_source_set_event_handler(_statsTimer, ^{
+            @autoreleasepool { [weakSelf dumpStats]; }
+        });
         dispatch_resume(_statsTimer);
     }
     return self;
 }
 
 - (void)dumpStats {
-    NSMutableString *s = [NSMutableString new];
+    uint32_t fmt = atomic_load(&_lastDstFmt);
+    uint32_t w   = atomic_load(&_lastDstW);
+    uint32_t h   = atomic_load(&_lastDstH);
+    char fcc[5] = {0};
+    fcc[0] = (fmt >> 24) & 0xff; fcc[1] = (fmt >> 16) & 0xff;
+    fcc[2] = (fmt >> 8) & 0xff;  fcc[3] = fmt & 0xff;
+
+    NSMutableString *s = [NSMutableString stringWithCapacity:512];
     [s appendFormat:@"=== vcam-msd stats @ %@ ===\n",
         [NSDateFormatter localizedStringFromDate:NSDate.date
                                        dateStyle:NSDateFormatterShortStyle
                                        timeStyle:NSDateFormatterMediumStyle]];
-    [s appendFormat:@"playerStarted: %d  enabled: %d  lastVTStatus: %d\n",
-        _playerStarted, _enabledCached, (int)_lastVTStatus];
-    [s appendFormat:@"hitTotal: %llu\n", _hitTotal];
-    [s appendFormat:@"  nonVideo:    %llu\n", _hitNonVideo];
-    [s appendFormat:@"  noPB:        %llu\n", _hitNoPB];
-    [s appendFormat:@"  lossyDst:    %llu (skipped — VT would corrupt)\n", _hitLossyDst];
-    [s appendFormat:@"  noSrc:       %llu (video player not ready)\n", _hitNoSrc];
-    [s appendFormat:@"  vtAttempt:   %llu\n", _hitVTAttempt];
-    [s appendFormat:@"  vtSuccess:   %llu\n", _hitVTSuccess];
-    [s appendFormat:@"  vtFail:      %llu\n", _hitVTFail];
-    [s appendFormat:@"unique shapes:\n"];
-    NSArray *keys = [_uniqueShapes.allKeys sortedArrayUsingComparator:^(id a, id b) {
-        return [_uniqueShapes[b] compare:_uniqueShapes[a]];
-    }];
-    for (NSString *k in keys) {
-        [s appendFormat:@"  %8@  %@\n", _uniqueShapes[k], k];
-    }
+    [s appendFormat:@"playerStarted=%d enabled=%d\n", _playerStarted, _enabledCached];
+    [s appendFormat:@"lastVTStatus=%d  lastDst=%ux%u '%s' (0x%08x)\n",
+        atomic_load(&_lastVTStatus), w, h, fcc, fmt];
+    [s appendFormat:@"hitTotal:    %llu\n", atomic_load(&_hitTotal)];
+    [s appendFormat:@"  nonVideo:  %llu\n", atomic_load(&_hitNonVideo)];
+    [s appendFormat:@"  noPB:      %llu\n", atomic_load(&_hitNoPB)];
+    [s appendFormat:@"  lossyDst:  %llu\n", atomic_load(&_hitLossyDst)];
+    [s appendFormat:@"  noSrc:     %llu\n", atomic_load(&_hitNoSrc)];
+    [s appendFormat:@"  vtAttempt: %llu\n", atomic_load(&_hitVTAttempt)];
+    [s appendFormat:@"  vtSuccess: %llu\n", atomic_load(&_hitVTSuccess)];
+    [s appendFormat:@"  vtFail:    %llu\n", atomic_load(&_hitVTFail)];
     [s writeToFile:kVCamStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
@@ -129,56 +132,49 @@ static BOOL vcam_isLossyDestination(OSType fmt) {
     return exists;
 }
 
+// Hot path — called ~1000-3000 times/sec. NO ObjC allocation, NO @synchronized,
+// NO NSString work. Counters are _Atomic increments.
 - (BOOL)replaceInPlace:(CMSampleBufferRef)sb {
     if (!sb) return NO;
-    _hitTotal++;
+    atomic_fetch_add_explicit(&_hitTotal, 1, memory_order_relaxed);
 
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
     if (!fmt || CMFormatDescriptionGetMediaType(fmt) != kCMMediaType_Video) {
-        _hitNonVideo++;
+        atomic_fetch_add_explicit(&_hitNonVideo, 1, memory_order_relaxed);
         return NO;
     }
 
     CVImageBufferRef dstPB = CMSampleBufferGetImageBuffer(sb);
     if (!dstPB) {
-        _hitNoPB++;
+        atomic_fetch_add_explicit(&_hitNoPB, 1, memory_order_relaxed);
         return NO;
     }
 
     OSType dstFmt = CVPixelBufferGetPixelFormatType(dstPB);
-    size_t dstW = CVPixelBufferGetWidth(dstPB);
-    size_t dstH = CVPixelBufferGetHeight(dstPB);
-
-    // Track unique shapes so the stats file shows what flowed through.
-    char fcc[5] = {0};
-    fcc[0] = (dstFmt >> 24) & 0xff; fcc[1] = (dstFmt >> 16) & 0xff;
-    fcc[2] = (dstFmt >> 8) & 0xff;  fcc[3] = dstFmt & 0xff;
-    NSString *shape = [NSString stringWithFormat:@"%zux%zu '%s' (0x%08x)",
-                       dstW, dstH, fcc, (unsigned)dstFmt];
-    @synchronized(_uniqueShapes) {
-        _uniqueShapes[shape] = @(_uniqueShapes[shape].unsignedLongLongValue + 1);
-    }
+    atomic_store_explicit(&_lastDstFmt, dstFmt, memory_order_relaxed);
+    atomic_store_explicit(&_lastDstW, (uint32_t)CVPixelBufferGetWidth(dstPB), memory_order_relaxed);
+    atomic_store_explicit(&_lastDstH, (uint32_t)CVPixelBufferGetHeight(dstPB), memory_order_relaxed);
 
     if (vcam_isLossyDestination(dstFmt)) {
-        _hitLossyDst++;
+        atomic_fetch_add_explicit(&_hitLossyDst, 1, memory_order_relaxed);
         return NO;
     }
 
     CVPixelBufferRef srcFrame = [_videoPlayer latestFrameRetained];
     if (!srcFrame) {
-        _hitNoSrc++;
+        atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
         return NO;
     }
 
-    _hitVTAttempt++;
+    atomic_fetch_add_explicit(&_hitVTAttempt, 1, memory_order_relaxed);
     OSStatus st = [_gpuProcessor transferFromStatus:srcFrame into:dstPB];
     CFRelease(srcFrame);
-    _lastVTStatus = st;
+    atomic_store_explicit(&_lastVTStatus, st, memory_order_relaxed);
     if (st == noErr) {
-        _hitVTSuccess++;
+        atomic_fetch_add_explicit(&_hitVTSuccess, 1, memory_order_relaxed);
         return YES;
     } else {
-        _hitVTFail++;
+        atomic_fetch_add_explicit(&_hitVTFail, 1, memory_order_relaxed);
         return NO;
     }
 }

@@ -1,14 +1,13 @@
 #import "LocalVideoPlayer.h"
 #import <AVFoundation/AVFoundation.h>
+#import <os/lock.h>
 
-// Target ~30fps decode pacing. The actual mediaserverd consumer rate may differ;
-// we just keep latestFrame fresh enough for the consumer to pick up.
 static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
 
 @implementation LocalVideoPlayer {
     NSString *_path;
     dispatch_queue_t _queue;
-    NSLock *_frameLock;
+    os_unfair_lock _frameLock;
     CVPixelBufferRef _latestFrame;
     BOOL _running;
     AVAssetReader *_reader;
@@ -19,7 +18,7 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
     if ((self = [super init])) {
         _path = [path copy];
         _queue = dispatch_queue_create("com.vcamplus.msd.decoder", DISPATCH_QUEUE_SERIAL);
-        _frameLock = [NSLock new];
+        _frameLock = OS_UNFAIR_LOCK_INIT;
     }
     return self;
 }
@@ -44,20 +43,21 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
     [_reader cancelReading];
     _reader = nil;
     _output = nil;
-    [_frameLock lock];
+    os_unfair_lock_lock(&_frameLock);
     if (_latestFrame) { CFRelease(_latestFrame); _latestFrame = NULL; }
-    [_frameLock unlock];
+    os_unfair_lock_unlock(&_frameLock);
 }
 
+// Hot path — called from mediaserverd's emit hook ~1000+ times per second.
+// os_unfair_lock with no contention is sub-microsecond. The CFRetain is
+// trivial. No allocation.
 - (CVPixelBufferRef)latestFrameRetained {
-    [_frameLock lock];
+    os_unfair_lock_lock(&_frameLock);
     CVPixelBufferRef pb = _latestFrame;
     if (pb) CFRetain(pb);
-    [_frameLock unlock];
+    os_unfair_lock_unlock(&_frameLock);
     return pb;
 }
-
-#pragma mark - Decoder loop
 
 - (BOOL)openReader {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:_path]
@@ -93,33 +93,32 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
         @synchronized(self) { running = _running; }
         if (!running) break;
 
-        if (!_reader || _reader.status != AVAssetReaderStatusReading) {
-            _reader = nil; _output = nil;
-            if (![self openReader]) {
-                // File missing or unreadable — back off and retry. The supervisor
-                // (VCamCore.isEnabled) will call stop() when the file goes away.
-                [NSThread sleepForTimeInterval:0.5];
+        @autoreleasepool {
+            if (!_reader || _reader.status != AVAssetReaderStatusReading) {
+                _reader = nil; _output = nil;
+                if (![self openReader]) {
+                    [NSThread sleepForTimeInterval:0.5];
+                    continue;
+                }
+            }
+
+            CMSampleBufferRef sb = [_output copyNextSampleBuffer];
+            if (!sb) {
+                [_reader cancelReading];
+                _reader = nil; _output = nil;
                 continue;
             }
+            CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+            if (pb) {
+                CFRetain(pb);
+                os_unfair_lock_lock(&_frameLock);
+                CVPixelBufferRef old = _latestFrame;
+                _latestFrame = pb;
+                os_unfair_lock_unlock(&_frameLock);
+                if (old) CFRelease(old);
+            }
+            CFRelease(sb);
         }
-
-        CMSampleBufferRef sb = [_output copyNextSampleBuffer];
-        if (!sb) {
-            // End of stream — recreate reader to loop the video.
-            [_reader cancelReading];
-            _reader = nil; _output = nil;
-            continue;
-        }
-        CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-        if (pb) {
-            CFRetain(pb);
-            [_frameLock lock];
-            CVPixelBufferRef old = _latestFrame;
-            _latestFrame = pb;
-            [_frameLock unlock];
-            if (old) CFRelease(old);
-        }
-        CFRelease(sb);
 
         [NSThread sleepForTimeInterval:kFrameInterval];
     }
