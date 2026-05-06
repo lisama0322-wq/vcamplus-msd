@@ -1,0 +1,42 @@
+name: Build VCamPlus MSD
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  THEOS: /opt/theos
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install ldid xz
+
+      - name: Clone Theos
+        run: |
+          sudo git clone --recursive https://github.com/theos/theos $THEOS
+          sudo chown -R "$USER" $THEOS
+
+      - name: Download iOS 16.5 SDK
+        run: |
+          curl -L -o sdk.tar.xz \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+          tar -xf sdk.tar.xz -C $THEOS/sdks/
+
+      - name: Build package
+        run: |
+          make package FINALPACKAGE=1 STRIP=1
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcamplus-msd-deb
+          path: packages/*.deb
+          retention-days: 30

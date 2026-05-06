@@ -1,0 +1,10 @@
+Package: com.vcamplus.msd
+Name: VCamPlus MediaServer 全局替换
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Depends: firmware (>= 15.0), mobilesubstrate
+Conflicts: com.local.vcameracrack
+Description: vcamplus 配套 mediaserverd 注入层，覆盖反注入 app 与网页相机帧（X / Bitget / Google 翻译 / KYC 等）。需配合主插件 com.vcamplus.tweak。
+Author: VCam2026
+Maintainer: VCam2026
+Section: Tweaks
