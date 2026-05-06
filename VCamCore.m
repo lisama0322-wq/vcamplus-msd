@@ -7,9 +7,15 @@
 #import <stdatomic.h>
 
 static NSString *const kVCamSourceVideo = @"/var/mobile/Media/DCIM/vcam.mp4";
+static NSString *const kVCamActiveFlag  = @"/var/mobile/Media/DCIM/vcam_msd_active";
 static NSString *const kVCamStatsFile   = @"/var/mobile/Media/DCIM/vcam_msd_stats.txt";
 
-static const uint64_t kEnabledCacheTTLNs = 200ULL * NSEC_PER_MSEC;
+// Hard isolation gate: hook is installed unconditionally but does nothing
+// unless BOTH the source video AND the active flag file exist. This lets us
+// verify the hook install itself is safe (file absent → zero hot-path work)
+// before turning on replacement. Touch the flag file to enable, delete to
+// disable. Mirrors vcam124's plist-gated design.
+static const uint64_t kEnabledCacheTTLNs = 500ULL * NSEC_PER_MSEC;
 
 // Lossy-compressed pixel formats. VTPixelTransferSession cannot write into
 // these (compressed-tile IOSurface backing). Skip outright.
@@ -115,21 +121,23 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     if (nowNs - _enabledCacheTime < kEnabledCacheTTLNs) return _enabledCached;
 
     struct stat st;
-    BOOL exists = (stat([kVCamSourceVideo fileSystemRepresentation], &st) == 0 && st.st_size > 0);
+    BOOL videoOK  = (stat([kVCamSourceVideo fileSystemRepresentation], &st) == 0 && st.st_size > 0);
+    BOOL activeOK = (stat([kVCamActiveFlag  fileSystemRepresentation], &st) == 0);
+    BOOL enabled  = videoOK && activeOK;
 
-    if (exists && !_playerStarted) {
+    if (videoOK && !_playerStarted) {
         [_videoPlayer start];
         _playerStarted = YES;
-        NSLog(@"[vcam-msd] enabled -> player started");
-    } else if (!exists && _playerStarted) {
+        NSLog(@"[vcam-msd] video source present -> player started");
+    } else if (!videoOK && _playerStarted) {
         [_videoPlayer stop];
         _playerStarted = NO;
-        NSLog(@"[vcam-msd] disabled -> player stopped");
+        NSLog(@"[vcam-msd] video source gone -> player stopped");
     }
 
-    _enabledCached = exists;
+    _enabledCached = enabled;
     _enabledCacheTime = nowNs;
-    return exists;
+    return enabled;
 }
 
 // Hot path — called ~1000-3000 times/sec. NO ObjC allocation, NO @synchronized,
