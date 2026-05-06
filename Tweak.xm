@@ -1,30 +1,38 @@
 // vcamplus-msd: mediaserverd-side virtual camera frame replacement.
 //
-// CMCapture framework (which owns BWNodeOutput) is lazy-loaded by mediaserverd
-// on first camera-client connect. Our __attribute__((constructor)) runs at
-// dylib load — long before any camera session — so objc_getClass("BWNodeOutput")
-// returns NULL and a one-shot install never runs.
+// CMCapture (which owns BWNodeOutput) is lazy-loaded by mediaserverd on first
+// camera-client connect. We must defer hook install until the class becomes
+// resolvable.
 //
-// v0.7.3 tried _dyld_register_func_for_add_image but the callback fires from
-// dyld BEFORE the loaded image's objc_init registers its classes, so the class
-// lookup still misses.
-//
-// v0.7.4 polls every 500ms on a background queue until BWNodeOutput becomes
-// resolvable, then installs the hook and cancels the timer. Adds at most ~0.5s
-// latency between camera launch and hook activation, well within human
-// perception.
+// History of install strategies:
+//   v0.7.0  one-shot at constructor → never installs (CMCapture not loaded)
+//   v0.7.3  _dyld_register_func_for_add_image → never installs (callback fires
+//           before objc_init for new image, so class still NULL)
+//   v0.7.4  dispatch_source_t timer @ QOS_BACKGROUND → never installs (timer
+//           apparently never fires inside mediaserverd's restricted dispatch
+//           environment)
+//   v0.7.5  dedicated pthread polling 500ms with explicit diagnostic counters
+//           (pollCount, lastClassNullState) exposed via VCamCore stats so we
+//           can see exactly which step is failing.
 
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
+#import <pthread.h>
+#import <unistd.h>
+#import <stdatomic.h>
 
 #import "VCamCore.h"
 
 typedef void (*EmitFn)(id, SEL, CMSampleBufferRef);
 static EmitFn gOrigBWNodeOutputEmit = NULL;
-static dispatch_source_t gInstallTimer = NULL;
+
+// Install diagnostics — readable by VCamCore.dumpStats.
+_Atomic int gInstallPollCount = 0;
+_Atomic int gInstallState     = 0;  // 0=polling no class, 1=class found, 2=method missing, 3=hooked OK
+_Atomic int gInstallHookKind  = 0;  // 1=MSHookMessageEx, 2=method_setImplementation
 
 static void hooked_emit(id _self, SEL sel, CMSampleBufferRef sb) {
     @autoreleasepool {
@@ -42,9 +50,14 @@ static void hooked_emit(id _self, SEL sel, CMSampleBufferRef sb) {
 static BOOL try_install(void) {
     Class cls = objc_getClass("BWNodeOutput");
     if (!cls) return NO;
+    atomic_store_explicit(&gInstallState, 1, memory_order_relaxed);
+
     SEL sel = @selector(emitSampleBuffer:);
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
+    if (!m) {
+        atomic_store_explicit(&gInstallState, 2, memory_order_relaxed);
+        return NO;
+    }
 
     IMP newImp = imp_implementationWithBlock(^(id _self, CMSampleBufferRef sb) {
         hooked_emit(_self, @selector(emitSampleBuffer:), sb);
@@ -53,13 +66,25 @@ static BOOL try_install(void) {
     @try { MSHookMessageEx(cls, sel, newImp, &origImp); } @catch (NSException *e) {}
     if (origImp) {
         gOrigBWNodeOutputEmit = (EmitFn)origImp;
-        NSLog(@"[vcam-msd] hooked -[BWNodeOutput emitSampleBuffer:] via MSHookMessageEx");
+        atomic_store_explicit(&gInstallHookKind, 1, memory_order_relaxed);
     } else {
         gOrigBWNodeOutputEmit = (EmitFn)method_getImplementation(m);
         method_setImplementation(m, newImp);
-        NSLog(@"[vcam-msd] hooked -[BWNodeOutput emitSampleBuffer:] via method_setImplementation");
+        atomic_store_explicit(&gInstallHookKind, 2, memory_order_relaxed);
     }
+    atomic_store_explicit(&gInstallState, 3, memory_order_relaxed);
+    NSLog(@"[vcam-msd] hooked -[BWNodeOutput emitSampleBuffer:] (kind=%d)",
+          atomic_load(&gInstallHookKind));
     return YES;
+}
+
+static void *install_thread_main(void *_unused) {
+    while (1) {
+        atomic_fetch_add_explicit(&gInstallPollCount, 1, memory_order_relaxed);
+        if (try_install()) return NULL;
+        usleep(500 * 1000);  // 500ms
+    }
+    return NULL;
 }
 
 __attribute__((constructor))
@@ -67,28 +92,20 @@ static void vcamplus_msd_init(void) {
     @autoreleasepool {
         NSString *proc = NSProcessInfo.processInfo.processName;
         if (![proc isEqualToString:@"mediaserverd"]) return;
-        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.7.4, polling install)");
+        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.7.5, pthread polling install)");
         NSLog(@"[vcam-msd] To activate: touch /var/mobile/Media/DCIM/vcam_msd_active");
         NSLog(@"[vcam-msd] Stats: /var/mobile/Media/DCIM/vcam_msd_stats.txt (every 5s)");
         (void)[VCamCore shared];
 
-        // Try once now in case CMCapture is already loaded.
         if (try_install()) return;
 
-        // Otherwise poll until BWNodeOutput appears (CMCapture lazy-loaded on
-        // first camera-client connect). Cancel timer once install succeeds.
-        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0);
-        gInstallTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        dispatch_source_set_timer(gInstallTimer,
-            dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
-            500 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
-        dispatch_source_set_event_handler(gInstallTimer, ^{
-            if (try_install()) {
-                dispatch_source_cancel(gInstallTimer);
-                gInstallTimer = NULL;
-            }
-        });
-        dispatch_resume(gInstallTimer);
-        NSLog(@"[vcam-msd] BWNodeOutput not yet loaded — polling every 500ms");
+        // Detached pthread polls indefinitely; exits when install succeeds.
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&th, &attr, install_thread_main, NULL);
+        pthread_attr_destroy(&attr);
+        NSLog(@"[vcam-msd] BWNodeOutput not yet loaded — pthread poller running");
     }
 }

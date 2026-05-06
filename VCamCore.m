@@ -113,6 +113,17 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     [s appendFormat:@"vtCount:  %llu\n", vtCount];
     [s appendFormat:@"vtMeanUs: %.1f µs  (mediaserverd CMSCreate baseline = 56µs median, 155µs p99)\n", vtMeanUs];
     [s appendFormat:@"vtMaxUs:  %.1f µs\n", vtMaxUs];
+
+    // Install diagnostics — declared as extern in Tweak.xm
+    extern _Atomic int gInstallPollCount;
+    extern _Atomic int gInstallState;
+    extern _Atomic int gInstallHookKind;
+    [s appendFormat:@"\n--- hook install diagnostics ---\n"];
+    [s appendFormat:@"installPollCount: %d\n", atomic_load(&gInstallPollCount)];
+    [s appendFormat:@"installState:     %d  (0=class missing, 1=class found, 2=method missing, 3=hooked OK)\n",
+        atomic_load(&gInstallState)];
+    [s appendFormat:@"installHookKind:  %d  (0=not yet, 1=MSHookMessageEx, 2=method_setImplementation)\n",
+        atomic_load(&gInstallHookKind)];
     [s writeToFile:kVCamStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
