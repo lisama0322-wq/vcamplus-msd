@@ -70,9 +70,10 @@ static void vcamplus_msd_init(void) {
     @autoreleasepool {
         NSString *proc = NSProcessInfo.processInfo.processName;
         if (![proc isEqualToString:@"mediaserverd"]) return;
-        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.6.0, hard-gated)");
+        NSLog(@"[vcam-msd] LOADED in mediaserverd (build 0.7.0, P0 fixes + VT latency stats)");
         NSLog(@"[vcam-msd] To activate: touch /var/mobile/Media/DCIM/vcam_msd_active");
         NSLog(@"[vcam-msd] To deactivate: rm /var/mobile/Media/DCIM/vcam_msd_active");
+        NSLog(@"[vcam-msd] Stats: /var/mobile/Media/DCIM/vcam_msd_stats.txt (every 5s)");
         (void)[VCamCore shared];
         install_emit_hook();
     }
