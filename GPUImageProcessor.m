@@ -38,12 +38,17 @@
             return self;
         }
 
-        // Resolve VT property keys at runtime. These are CFStringRef *constants*
-        // exported as data, so dlsym returns a pointer to the CFStringRef.
-        void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_LAZY);
-        CFStringRef *pRT  = vt ? (CFStringRef *)dlsym(vt, "kVTPixelTransferPropertyKey_RealTime")    : NULL;
-        CFStringRef *pSM  = vt ? (CFStringRef *)dlsym(vt, "kVTPixelTransferPropertyKey_ScalingMode") : NULL;
-        CFStringRef *pCrop= vt ? (CFStringRef *)dlsym(vt, "kVTScalingMode_CropSourceToCleanAperture"): NULL;
+        // Resolve VT property keys via RTLD_DEFAULT — searches all already-
+        // loaded images. Calling VTPixelTransferSessionCreate above implicitly
+        // loaded VideoToolbox into our process, so the symbols are reachable.
+        // (dlopen("/System/.../VideoToolbox", ...) FAILS on iOS 16+ because
+        // frameworks live in dyld shared cache without on-disk binary paths.
+        // That was the v0.7.6 bug: handle was NULL → all dlsyms NULL → no
+        // properties set → VT defaulted to slow path (2.5ms per call vs
+        // ~50µs target).)
+        CFStringRef *pRT  = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_RealTime");
+        CFStringRef *pSM  = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_ScalingMode");
+        CFStringRef *pCrop= (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTScalingMode_CropSourceToCleanAperture");
 
         if (pRT && *pRT) {
             VTSessionSetProperty(_session, *pRT, kCFBooleanTrue);
