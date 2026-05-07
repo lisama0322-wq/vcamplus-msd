@@ -203,14 +203,15 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         return NO;
     }
 
-    // CRITICAL throttle (vcam124-style): skip replacement when this src frame
-    // was already consumed by a previous emit. Caps replacement rate at source
-    // frame rate (~30/s) regardless of mediaserverd emit rate (which can hit
-    // 800+/s for the system Camera app and would otherwise saturate CPU).
+    // Always keep dst's pixel content consistent: every emit gets fake content
+    // written. To control CPU, the GPUImageProcessor cache rebuild is gated by
+    // srcID change (~30/sec heavy work), and the per-emit fast path (cached →
+    // dst) is plain CPU memcpy. This produces a UNIFORM stream of fake frames
+    // for all consumers (encoder, preview, KYC) instead of v0.8.2's intermittent
+    // skip that confused the Camera record pipeline (black video / 0:00 timer).
     uint64_t srcID = [_videoPlayer latestFrameID];
-    uint64_t lastID = atomic_load_explicit(&_lastConsumedSrcID, memory_order_acquire);
-    if (srcID == 0 || srcID == lastID) {
-        atomic_fetch_add_explicit(&_hitAlreadyConsumed, 1, memory_order_relaxed);
+    if (srcID == 0) {
+        atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
         return NO;
     }
 
@@ -223,11 +224,7 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     atomic_fetch_add_explicit(&_hitVTAttempt, 1, memory_order_relaxed);
     BOOL ok = [_gpuProcessor transferFrom:srcFrame srcID:srcID into:dstPB];
     CFRelease(srcFrame);
-    if (ok) {
-        // Mark this src frame as consumed; subsequent emits with same srcID
-        // will skip until LocalVideoPlayer produces a new frame.
-        atomic_store_explicit(&_lastConsumedSrcID, srcID, memory_order_release);
-    }
+    atomic_store_explicit(&_lastConsumedSrcID, srcID, memory_order_relaxed);  // for stats only
     if (ok) {
         atomic_fetch_add_explicit(&_hitVTSuccess, 1, memory_order_relaxed);
         return YES;
