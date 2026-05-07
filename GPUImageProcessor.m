@@ -3,6 +3,54 @@
 #import <mach/mach_time.h>
 #import <stdatomic.h>
 #import <dlfcn.h>
+#import <string.h>
+
+// CPU memcpy copy of one CVPixelBuffer's pixel content into another. Both
+// must have the same dimensions and format. Handles planar (YUV) and chunky
+// (BGRA) layouts.
+//
+// vcam124's transferPixelBuffer:toPixelBuffer: helper at 0x1ed98 does this
+// when its VT session pointer is NULL — and for our use case (cached → dst,
+// same geometry/format), CPU memcpy beats VTPixelTransferSessionTransferImage
+// in mediaserverd's sandboxed context, where VT apparently can't reach
+// Metal/GPU and falls to a slow software path even for trivial copies.
+static BOOL vcam_cpuCopyPixelBuffer(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return NO;
+    }
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return NO;
+    }
+    BOOL planar = CVPixelBufferIsPlanar(src);
+    if (!planar) {
+        const uint8_t *sp = CVPixelBufferGetBaseAddress(src);
+        uint8_t *dp = CVPixelBufferGetBaseAddress(dst);
+        size_t ss = CVPixelBufferGetBytesPerRow(src);
+        size_t ds = CVPixelBufferGetBytesPerRow(dst);
+        size_t h  = CVPixelBufferGetHeight(src);
+        size_t copy = ss < ds ? ss : ds;
+        if (sp && dp) {
+            for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, copy);
+        }
+    } else {
+        size_t np = CVPixelBufferGetPlaneCount(src);
+        for (size_t p = 0; p < np; p++) {
+            const uint8_t *sp = CVPixelBufferGetBaseAddressOfPlane(src, p);
+            uint8_t *dp = CVPixelBufferGetBaseAddressOfPlane(dst, p);
+            size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, p);
+            size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
+            size_t h  = CVPixelBufferGetHeightOfPlane(src, p);
+            size_t copy = ss < ds ? ss : ds;
+            if (sp && dp) {
+                for (size_t y = 0; y < h; y++) memcpy(dp + y*ds, sp + y*ss, copy);
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return YES;
+}
 
 @implementation GPUImageProcessor {
     VTPixelTransferSessionRef _session;
@@ -124,8 +172,12 @@
 
     OSStatus s = noErr;
     if (rebuildStatus == noErr) {
-        // FAST path: cached → dst, same dim/fmt/orientation, hardware blit.
-        s = VTPixelTransferSessionTransferImage(_session, _cached, dst);
+        // FAST path: cached → dst, same dim/fmt/orientation. Use CPU memcpy
+        // (CVPixelBufferLockBaseAddress + memcpy + Unlock). VT in
+        // mediaserverd's context goes through a software path even for
+        // trivial copies (~2.5ms), while this memcpy completes in <1ms for
+        // 8MB BGRA / <0.5ms for 3MB YUV.
+        s = vcam_cpuCopyPixelBuffer(_cached, dst) ? noErr : -1;
     } else {
         s = rebuildStatus;
     }
