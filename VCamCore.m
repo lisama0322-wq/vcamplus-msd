@@ -92,6 +92,12 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     uint64_t vtMaxNs = [_gpuProcessor vtMaxNs];
     double vtMeanUs = vtCount > 0 ? (double)vtTotalNs / vtCount / 1000.0 : 0.0;
     double vtMaxUs = vtMaxNs / 1000.0;
+    uint64_t cacheHits = [_gpuProcessor cacheHitCount];
+    uint64_t cacheRebuilds = [_gpuProcessor cacheRebuildCount];
+    uint64_t cacheRebuildNs = [_gpuProcessor cacheRebuildTotalNs];
+    double rebuildMeanUs = cacheRebuilds > 0 ? (double)cacheRebuildNs / cacheRebuilds / 1000.0 : 0.0;
+    double cacheHitRate = (cacheHits + cacheRebuilds) > 0
+        ? 100.0 * cacheHits / (cacheHits + cacheRebuilds) : 0.0;
 
     NSMutableString *s = [NSMutableString stringWithCapacity:1024];
     [s appendFormat:@"=== vcam-msd v0.7 stats @ %@ ===\n",
@@ -109,10 +115,14 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     [s appendFormat:@"  vtAttempt: %llu\n", atomic_load(&_hitVTAttempt)];
     [s appendFormat:@"  vtSuccess: %llu\n", atomic_load(&_hitVTSuccess)];
     [s appendFormat:@"  vtFail:    %llu\n", atomic_load(&_hitVTFail)];
-    [s appendFormat:@"\n--- VT latency (P0 fixes: RealTime + CropSourceToCleanAperture) ---\n"];
-    [s appendFormat:@"vtCount:  %llu\n", vtCount];
-    [s appendFormat:@"vtMeanUs: %.1f µs  (mediaserverd CMSCreate baseline = 56µs median, 155µs p99)\n", vtMeanUs];
-    [s appendFormat:@"vtMaxUs:  %.1f µs\n", vtMaxUs];
+    [s appendFormat:@"\n--- VT latency (P0+cache: RealTime + CropMode + cached transfer) ---\n"];
+    [s appendFormat:@"vtCount:        %llu  (every emit that called transferFrom)\n", vtCount];
+    [s appendFormat:@"vtMeanUs:       %.1f µs  (overall, mixing fast and slow path)\n", vtMeanUs];
+    [s appendFormat:@"vtMaxUs:        %.1f µs\n", vtMaxUs];
+    [s appendFormat:@"cacheHits:      %llu  (fast path = cached → dst, hardware blit)\n", cacheHits];
+    [s appendFormat:@"cacheRebuilds:  %llu  (slow path = src → cached, scale+rotate+convert)\n", cacheRebuilds];
+    [s appendFormat:@"cacheHitRate:   %.1f%%\n", cacheHitRate];
+    [s appendFormat:@"rebuildMeanUs:  %.1f µs  (per slow-path call; expect ~2000µs first-time)\n", rebuildMeanUs];
 
     // Install diagnostics — declared as extern in Tweak.xm
     extern _Atomic int gInstallPollCount;
@@ -191,7 +201,8 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     }
 
     atomic_fetch_add_explicit(&_hitVTAttempt, 1, memory_order_relaxed);
-    BOOL ok = [_gpuProcessor transferFrom:srcFrame into:dstPB];
+    uint64_t srcID = [_videoPlayer latestFrameID];
+    BOOL ok = [_gpuProcessor transferFrom:srcFrame srcID:srcID into:dstPB];
     CFRelease(srcFrame);
     if (ok) {
         atomic_fetch_add_explicit(&_hitVTSuccess, 1, memory_order_relaxed);

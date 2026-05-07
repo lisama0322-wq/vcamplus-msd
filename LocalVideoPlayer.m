@@ -1,6 +1,7 @@
 #import "LocalVideoPlayer.h"
 #import <AVFoundation/AVFoundation.h>
 #import <os/lock.h>
+#import <stdatomic.h>
 
 static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
 
@@ -9,6 +10,7 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
     dispatch_queue_t _queue;
     os_unfair_lock _frameLock;
     CVPixelBufferRef _latestFrame;
+    _Atomic uint64_t _frameID;
     BOOL _running;
     AVAssetReader *_reader;
     AVAssetReaderTrackOutput *_output;
@@ -48,15 +50,16 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
     os_unfair_lock_unlock(&_frameLock);
 }
 
-// Hot path — called from mediaserverd's emit hook ~1000+ times per second.
-// os_unfair_lock with no contention is sub-microsecond. The CFRetain is
-// trivial. No allocation.
 - (CVPixelBufferRef)latestFrameRetained {
     os_unfair_lock_lock(&_frameLock);
     CVPixelBufferRef pb = _latestFrame;
     if (pb) CFRetain(pb);
     os_unfair_lock_unlock(&_frameLock);
     return pb;
+}
+
+- (uint64_t)latestFrameID {
+    return atomic_load_explicit(&_frameID, memory_order_relaxed);
 }
 
 - (BOOL)openReader {
@@ -114,6 +117,7 @@ static const NSTimeInterval kFrameInterval = 1.0 / 30.0;
                 os_unfair_lock_lock(&_frameLock);
                 CVPixelBufferRef old = _latestFrame;
                 _latestFrame = pb;
+                atomic_fetch_add_explicit(&_frameID, 1, memory_order_relaxed);
                 os_unfair_lock_unlock(&_frameLock);
                 if (old) CFRelease(old);
             }

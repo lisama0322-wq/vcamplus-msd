@@ -4,27 +4,24 @@
 #import <stdatomic.h>
 #import <dlfcn.h>
 
-// vcam124 reads kVTPixelTransferPropertyKey_RealTime / kVTScalingMode_*
-// indirectly from __DATA_CONST (ldr through GOT). If they aren't exported on
-// the running iOS version, that ldr returns NULL and the function skips.
-//
-// We were calling VTSessionSetProperty with these constants directly. If the
-// symbol isn't published as a weak export on iOS 16.5, dyld fails to bind
-// and the entire vcamplus-msd.dylib silently fails to load — explaining why
-// v0.7 / v0.7.1 produced real-camera output (no dylib in mediaserverd) while
-// v0.5 (which never referenced these symbols) did load and replace frames.
-//
-// Resolve via dlsym at init time. Missing symbol = skip property; dylib still
-// loads cleanly.
-
 @implementation GPUImageProcessor {
     VTPixelTransferSessionRef _session;
     NSRecursiveLock *_lock;
     mach_timebase_info_data_t _tb;
 
+    // Cache of preconverted source: matches current dst geometry.
+    CVPixelBufferRef _cached;
+    size_t   _cachedW;
+    size_t   _cachedH;
+    OSType   _cachedFmt;
+    uint64_t _cachedSrcID;
+
     _Atomic uint64_t _vtCount;
     _Atomic uint64_t _vtTotalNs;
     _Atomic uint64_t _vtMaxNs;
+    _Atomic uint64_t _cacheHits;
+    _Atomic uint64_t _cacheRebuilds;
+    _Atomic uint64_t _cacheRebuildTotalNs;
 }
 
 - (instancetype)init {
@@ -38,30 +35,20 @@
             return self;
         }
 
-        // Resolve VT property keys via RTLD_DEFAULT — searches all already-
-        // loaded images. Calling VTPixelTransferSessionCreate above implicitly
-        // loaded VideoToolbox into our process, so the symbols are reachable.
-        // (dlopen("/System/.../VideoToolbox", ...) FAILS on iOS 16+ because
-        // frameworks live in dyld shared cache without on-disk binary paths.
-        // That was the v0.7.6 bug: handle was NULL → all dlsyms NULL → no
-        // properties set → VT defaulted to slow path (2.5ms per call vs
-        // ~50µs target).)
+        // Resolve VT property keys via RTLD_DEFAULT (iOS 16+ frameworks live
+        // in dyld_shared_cache; dlopen by path returns NULL).
         CFStringRef *pRT  = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_RealTime");
         CFStringRef *pSM  = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_ScalingMode");
         CFStringRef *pCrop= (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTScalingMode_CropSourceToCleanAperture");
-
-        if (pRT && *pRT) {
-            VTSessionSetProperty(_session, *pRT, kCFBooleanTrue);
-        }
-        if (pSM && *pSM && pCrop && *pCrop) {
-            VTSessionSetProperty(_session, *pSM, *pCrop);
-        }
-        NSLog(@"[vcam-msd] VT session: RT=%p SM=%p Crop=%p", pRT, pSM, pCrop);
+        if (pRT && *pRT) VTSessionSetProperty(_session, *pRT, kCFBooleanTrue);
+        if (pSM && *pSM && pCrop && *pCrop) VTSessionSetProperty(_session, *pSM, *pCrop);
+        NSLog(@"[vcam-msd] VT session configured (RT=%p Crop=%p)", pRT, pCrop);
     }
     return self;
 }
 
 - (void)dealloc {
+    if (_cached) { CFRelease(_cached); _cached = NULL; }
     if (_session) {
         VTPixelTransferSessionInvalidate(_session);
         CFRelease(_session);
@@ -69,12 +56,82 @@
     }
 }
 
-- (BOOL)transferFrom:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst {
+// Allocate (or reuse) a cached pixel buffer matching the requested geometry.
+// Caller holds _lock.
+- (BOOL)ensureCacheBufferW:(size_t)w H:(size_t)h fmt:(OSType)fmt {
+    if (_cached && _cachedW == w && _cachedH == h && _cachedFmt == fmt) return YES;
+    if (_cached) { CFRelease(_cached); _cached = NULL; }
+    NSDictionary *attrs = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+        (NSString *)kCVPixelBufferWidthKey: @(w),
+        (NSString *)kCVPixelBufferHeightKey: @(h),
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef pb = NULL;
+    CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
+                                     (__bridge CFDictionaryRef)attrs, &pb);
+    if (r != kCVReturnSuccess || !pb) {
+        NSLog(@"[vcam-msd] cache CVPixelBufferCreate failed: %d (%zux%zu fmt=0x%x)",
+              r, w, h, (unsigned)fmt);
+        return NO;
+    }
+    _cached = pb;
+    _cachedW = w; _cachedH = h; _cachedFmt = fmt;
+    return YES;
+}
+
+- (BOOL)transferFrom:(CVPixelBufferRef)src
+               srcID:(uint64_t)srcID
+                into:(CVPixelBufferRef)dst {
     if (!src || !dst || !_session) return NO;
+
+    size_t dstW = CVPixelBufferGetWidth(dst);
+    size_t dstH = CVPixelBufferGetHeight(dst);
+    OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
+
     uint64_t t0 = mach_absolute_time();
+
     [_lock lock];
-    OSStatus s = VTPixelTransferSessionTransferImage(_session, src, dst);
+
+    BOOL needRebuild = (
+        !_cached ||
+        _cachedW != dstW || _cachedH != dstH || _cachedFmt != dstFmt ||
+        _cachedSrcID != srcID
+    );
+
+    OSStatus rebuildStatus = noErr;
+    if (needRebuild) {
+        if (![self ensureCacheBufferW:dstW H:dstH fmt:dstFmt]) {
+            [_lock unlock];
+            return NO;
+        }
+        // SLOW path: scale+rotate+convert src into cached buffer.
+        // VT does the geometric transform here. Falls to software path if
+        // src/dst orientation/aspect mismatch — but only happens once per
+        // source frame per dst geometry, not every emit.
+        uint64_t r0 = mach_absolute_time();
+        rebuildStatus = VTPixelTransferSessionTransferImage(_session, src, _cached);
+        uint64_t r1 = mach_absolute_time();
+        if (rebuildStatus == noErr) {
+            _cachedSrcID = srcID;
+            uint64_t dtNs = (r1 - r0) * _tb.numer / _tb.denom;
+            atomic_fetch_add_explicit(&_cacheRebuilds, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&_cacheRebuildTotalNs, dtNs, memory_order_relaxed);
+        }
+    } else {
+        atomic_fetch_add_explicit(&_cacheHits, 1, memory_order_relaxed);
+    }
+
+    OSStatus s = noErr;
+    if (rebuildStatus == noErr) {
+        // FAST path: cached → dst, same dim/fmt/orientation, hardware blit.
+        s = VTPixelTransferSessionTransferImage(_session, _cached, dst);
+    } else {
+        s = rebuildStatus;
+    }
+
     [_lock unlock];
+
     uint64_t t1 = mach_absolute_time();
     uint64_t dtNs = (t1 - t0) * _tb.numer / _tb.denom;
     atomic_fetch_add_explicit(&_vtCount,   1,    memory_order_relaxed);
@@ -83,11 +140,15 @@
     while (dtNs > prev &&
            !atomic_compare_exchange_weak_explicit(&_vtMaxNs, &prev, dtNs,
                memory_order_relaxed, memory_order_relaxed)) {}
+
     return (s == noErr);
 }
 
-- (uint64_t)vtCallCount { return atomic_load_explicit(&_vtCount,   memory_order_relaxed); }
-- (uint64_t)vtTotalNs   { return atomic_load_explicit(&_vtTotalNs, memory_order_relaxed); }
-- (uint64_t)vtMaxNs     { return atomic_load_explicit(&_vtMaxNs,   memory_order_relaxed); }
+- (uint64_t)vtCallCount          { return atomic_load_explicit(&_vtCount,            memory_order_relaxed); }
+- (uint64_t)vtTotalNs            { return atomic_load_explicit(&_vtTotalNs,          memory_order_relaxed); }
+- (uint64_t)vtMaxNs              { return atomic_load_explicit(&_vtMaxNs,            memory_order_relaxed); }
+- (uint64_t)cacheHitCount        { return atomic_load_explicit(&_cacheHits,          memory_order_relaxed); }
+- (uint64_t)cacheRebuildCount    { return atomic_load_explicit(&_cacheRebuilds,      memory_order_relaxed); }
+- (uint64_t)cacheRebuildTotalNs  { return atomic_load_explicit(&_cacheRebuildTotalNs,memory_order_relaxed); }
 
 @end

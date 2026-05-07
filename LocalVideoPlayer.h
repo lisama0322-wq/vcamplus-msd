@@ -10,15 +10,18 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (instancetype)initWithPath:(NSString *)path;
 
-/// Start the decode loop on a background queue. Idempotent.
 - (void)start;
-
-/// Stop the decode loop. Releases the cached frame.
 - (void)stop;
 
-/// Returns a retained snapshot of the latest decoded frame, or NULL if not
-/// yet ready or the decoder has stopped. Caller must CFRelease().
+/// Returns a retained snapshot of the latest decoded frame, or NULL.
 - (nullable CVPixelBufferRef)latestFrameRetained CF_RETURNS_RETAINED;
+
+/// Monotonic counter incremented every time the decoder produces a new frame.
+/// GPUImageProcessor uses this to invalidate the cached rotated buffer when
+/// the source frame content changes (~30 changes/sec at 30fps source). The
+/// emit hook calls this 1000+/sec but the ID only changes ~30/sec, so the
+/// fast path (cache hit) runs ~970× per source frame.
+- (uint64_t)latestFrameID;
 
 @end
 
