@@ -44,12 +44,19 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     _Atomic uint64_t _hitNoPB;
     _Atomic uint64_t _hitLossyDst;
     _Atomic uint64_t _hitNoSrc;
+    _Atomic uint64_t _hitAlreadyConsumed;  // skipped because srcID already used
     _Atomic uint64_t _hitVTAttempt;
     _Atomic uint64_t _hitVTSuccess;
     _Atomic uint64_t _hitVTFail;
     _Atomic uint32_t _lastDstFmt;
     _Atomic uint32_t _lastDstW;
     _Atomic uint32_t _lastDstH;
+
+    // Throttle replacement to source frame rate (matches vcam124's
+    // hasReplacementFrame gate that consumes liveBGRASampleBuffer once per
+    // decoded frame). frida measurement of vcam124 during Camera recording:
+    // 749 emit/sec, 145 VT/sec — vcam124 skips ~80% of emits via this gate.
+    _Atomic uint64_t _lastConsumedSrcID;
 
     dispatch_source_t _statsTimer;
 }
@@ -107,14 +114,16 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     [s appendFormat:@"playerStarted=%d enabled=%d\n", _playerStarted, _enabledCached];
     [s appendFormat:@"lastDst=%ux%u '%s' (0x%08x)\n", w, h, fcc, fmt];
     [s appendFormat:@"\n--- emit hit breakdown ---\n"];
-    [s appendFormat:@"hitTotal:    %llu\n", atomic_load(&_hitTotal)];
-    [s appendFormat:@"  nonVideo:  %llu\n", atomic_load(&_hitNonVideo)];
-    [s appendFormat:@"  noPB:      %llu\n", atomic_load(&_hitNoPB)];
-    [s appendFormat:@"  lossyDst:  %llu\n", atomic_load(&_hitLossyDst)];
-    [s appendFormat:@"  noSrc:     %llu\n", atomic_load(&_hitNoSrc)];
-    [s appendFormat:@"  vtAttempt: %llu\n", atomic_load(&_hitVTAttempt)];
-    [s appendFormat:@"  vtSuccess: %llu\n", atomic_load(&_hitVTSuccess)];
-    [s appendFormat:@"  vtFail:    %llu\n", atomic_load(&_hitVTFail)];
+    [s appendFormat:@"hitTotal:        %llu\n", atomic_load(&_hitTotal)];
+    [s appendFormat:@"  nonVideo:      %llu\n", atomic_load(&_hitNonVideo)];
+    [s appendFormat:@"  noPB:          %llu\n", atomic_load(&_hitNoPB)];
+    [s appendFormat:@"  lossyDst:      %llu\n", atomic_load(&_hitLossyDst)];
+    [s appendFormat:@"  alreadyDone:   %llu  (srcID throttle: src frame already consumed)\n",
+        atomic_load(&_hitAlreadyConsumed)];
+    [s appendFormat:@"  noSrc:         %llu\n", atomic_load(&_hitNoSrc)];
+    [s appendFormat:@"  vtAttempt:     %llu\n", atomic_load(&_hitVTAttempt)];
+    [s appendFormat:@"  vtSuccess:     %llu\n", atomic_load(&_hitVTSuccess)];
+    [s appendFormat:@"  vtFail:        %llu\n", atomic_load(&_hitVTFail)];
     [s appendFormat:@"\n--- VT latency (P0+cache: RealTime + CropMode + cached transfer) ---\n"];
     [s appendFormat:@"vtCount:        %llu  (every emit that called transferFrom)\n", vtCount];
     [s appendFormat:@"vtMeanUs:       %.1f µs  (overall, mixing fast and slow path)\n", vtMeanUs];
@@ -194,6 +203,17 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
         return NO;
     }
 
+    // CRITICAL throttle (vcam124-style): skip replacement when this src frame
+    // was already consumed by a previous emit. Caps replacement rate at source
+    // frame rate (~30/s) regardless of mediaserverd emit rate (which can hit
+    // 800+/s for the system Camera app and would otherwise saturate CPU).
+    uint64_t srcID = [_videoPlayer latestFrameID];
+    uint64_t lastID = atomic_load_explicit(&_lastConsumedSrcID, memory_order_acquire);
+    if (srcID == 0 || srcID == lastID) {
+        atomic_fetch_add_explicit(&_hitAlreadyConsumed, 1, memory_order_relaxed);
+        return NO;
+    }
+
     CVPixelBufferRef srcFrame = [_videoPlayer latestFrameRetained];
     if (!srcFrame) {
         atomic_fetch_add_explicit(&_hitNoSrc, 1, memory_order_relaxed);
@@ -201,9 +221,13 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     }
 
     atomic_fetch_add_explicit(&_hitVTAttempt, 1, memory_order_relaxed);
-    uint64_t srcID = [_videoPlayer latestFrameID];
     BOOL ok = [_gpuProcessor transferFrom:srcFrame srcID:srcID into:dstPB];
     CFRelease(srcFrame);
+    if (ok) {
+        // Mark this src frame as consumed; subsequent emits with same srcID
+        // will skip until LocalVideoPlayer produces a new frame.
+        atomic_store_explicit(&_lastConsumedSrcID, srcID, memory_order_release);
+    }
     if (ok) {
         atomic_fetch_add_explicit(&_hitVTSuccess, 1, memory_order_relaxed);
         return YES;
