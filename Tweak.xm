@@ -76,12 +76,12 @@ static BOOL hook_class_emit(Class cls) {
     IMP newImp = imp_implementationWithBlock(^(id _self, CMSampleBufferRef sb) {
         hooked_emit(_self, @selector(emitSampleBuffer:), sb);
     });
-    IMP origImp = NULL;
-    @try { MSHookMessageEx(cls, sel, newImp, &origImp); } @catch (NSException *e) {}
-    if (!origImp) {
-        origImp = method_getImplementation(m);
-        method_setImplementation(m, newImp);
-    }
+    // arm64e PAC: MSHookMessageEx silently fails to update the method
+    // dispatch table (returns non-NULL origImp but the IMP slot retains its
+    // original PAC-signed value). method_setImplementation is PAC-aware in
+    // modern dyld and correctly re-signs the new IMP. Use it exclusively.
+    IMP origImp = method_getImplementation(m);
+    method_setImplementation(m, newImp);
     if (!gOrigEmitByClass) gOrigEmitByClass = [NSMutableDictionary new];
     @synchronized(gOrigEmitByClass) {
         gOrigEmitByClass[[NSValue valueWithPointer:(__bridge const void *)cls]] =
