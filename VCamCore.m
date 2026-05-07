@@ -118,12 +118,18 @@ static inline BOOL vcam_isLossyDestination(OSType fmt) {
     extern _Atomic int gInstallPollCount;
     extern _Atomic int gInstallState;
     extern _Atomic int gInstallHookKind;
+    extern _Atomic int gInstallSubclassHits;
+    extern _Atomic int gFirstClassReachedHook;
     [s appendFormat:@"\n--- hook install diagnostics ---\n"];
-    [s appendFormat:@"installPollCount: %d\n", atomic_load(&gInstallPollCount)];
-    [s appendFormat:@"installState:     %d  (0=class missing, 1=class found, 2=method missing, 3=hooked OK)\n",
+    [s appendFormat:@"installPollCount:    %d\n", atomic_load(&gInstallPollCount)];
+    [s appendFormat:@"installState:        %d  (0=class missing, 1=class found, 2=no class owns method, 3=hooked OK)\n",
         atomic_load(&gInstallState)];
-    [s appendFormat:@"installHookKind:  %d  (0=not yet, 1=MSHookMessageEx, 2=method_setImplementation)\n",
+    [s appendFormat:@"installHookKind:     %d  (0=not yet, 1=MSHookMessageEx, 2=method_setImplementation)\n",
         atomic_load(&gInstallHookKind)];
+    [s appendFormat:@"installSubclassHits: %d  (total emit-implementing classes hooked)\n",
+        atomic_load(&gInstallSubclassHits)];
+    [s appendFormat:@"emitHookEverFired:   %d  (1 if any hooked class's emit was actually called)\n",
+        atomic_load(&gFirstClassReachedHook)];
     [s writeToFile:kVCamStatsFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
